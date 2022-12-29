@@ -55,11 +55,19 @@ def generate_rotated_square_from_point(point: Point, length: float, angle: float
     return affinity.rotate(geom=point.buffer(distance=length / 2.0, cap_style=3), angle=angle, origin='centroid')
 
 
-def remove_contained_points_in_objects_from_geodataframe(data: GeoDataFrame, objects: GeoDataFrame) -> GeoDataFrame:
+def remove_contained_points_in_objects_from_geodataframe(data: GeoDataFrame, blocks: GeoDataFrame, objects: GeoDataFrame) -> GeoDataFrame:
     polygons = data[data.geometry.geom_type == 'Polygon']
     points = data[data.geometry.geom_type == 'Point']
-    contained_points = points[points.within(pd.concat([polygons.geometry, objects.geometry], ignore_index=True).unary_union)]
-    return data.drop(contained_points.index, axis=0)
+    indexes = []
+    for _, block in blocks.iterrows():
+        block_points = points[points[block_id_label] == block['id']]
+        if not block_points.empty:
+            geometry_1 = polygons[polygons[block_id_label] == block['id']].geometry
+            geometry_2 = objects[objects[block_id_label] == block['id']].geometry
+            all_geometry = pd.concat([geometry_1, geometry_2], ignore_index=True).unary_union
+            contained_points = block_points[block_points.within(all_geometry)]
+            indexes.extend(contained_points.index)
+    return data.drop(indexes, axis=0)
 
 
 def main():
@@ -72,9 +80,9 @@ def main():
 
     playgrounds = gpd.read_file(filename=Path.cwd() / 'data' / 'test' / 'input_playgrounds.geojson').set_crs(crs=standard_crs)
     playgrounds = playgrounds.explode(ignore_index=True)
-    playgrounds = remove_contained_points_in_objects_from_geodataframe(data=playgrounds, objects=buildings)
     playgrounds = remove_objects_outside_blocks_and_set_block_id(blocks=blocks, objects=playgrounds)
-    playgrounds['area'] = get_square_meters_area(playgrounds)
+    playgrounds = remove_contained_points_in_objects_from_geodataframe(data=playgrounds, blocks=blocks, objects=buildings)
+    playgrounds['area'] = get_square_meters_area(objects=playgrounds)
     playgrounds = transform_point_objects_into_square_polygons_with_median_area(blocks=blocks, objects=playgrounds)
     playgrounds.to_file(filename='result.geojson', driver='GeoJSON')
 
