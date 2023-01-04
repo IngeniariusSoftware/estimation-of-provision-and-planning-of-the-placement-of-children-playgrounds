@@ -1,7 +1,7 @@
 import math
 import scipy
-import pandana
 import logging
+import numpy as np
 import osmnx as ox
 import pandas as pd
 import networkx as nx
@@ -9,7 +9,6 @@ import geopandas as gpd
 
 from pathlib import Path
 from pandas import Series
-from pandana import Network
 from shapely import affinity
 from networkx import MultiDiGraph
 from geopandas import GeoDataFrame, GeoSeries
@@ -27,7 +26,7 @@ def remove_objects_outside_blocks_and_set_block_id(blocks: GeoDataFrame, objects
         logging.warning(f' objects geoDataFrame already contains {block_id_label} column, renamed to {block_id_label}_(2)')
         inside_objects = inside_objects.rename(columns={block_id_label: f'{block_id_label}_(2)'})
     inside_objects = inside_objects.rename(columns={'id_right': block_id_label})
-    inside_objects = inside_objects[inside_objects[block_id_label].notna()]
+    inside_objects = inside_objects[inside_objects[block_id_label].notna()].reset_index()
     inside_objects = inside_objects.drop(columns=['index_right'])
     inside_objects = inside_objects.astype(dtype={block_id_label: int}, copy=False)
     logging.info(f' {len(objects) - len(inside_objects)} objects outside the blocks were deleted')
@@ -50,7 +49,7 @@ def transform_point_objects_into_square_polygons_with_median_area(blocks: GeoDat
     angles = list(blocks.geometry.apply(func=lambda x: get_geometry_angle(x)))
     points.geometry = points.apply(
         func=lambda x: generate_rotated_square_from_point(point=x.geometry, length=square_length, angle=angles[x[block_id_label]]), axis=1)
-    return pd.concat(objs=[polygons, points])
+    return pd.concat(objs=[polygons, points]).reset_index()
 
 
 def generate_rotated_square_from_point(point: Point, length: float, angle: float) -> Polygon:
@@ -72,11 +71,9 @@ def remove_contained_points_in_objects_from_geodataframe(data: GeoDataFrame, blo
     return data.drop(indexes, axis=0)
 
 
-def get_walk_graph(blocks: GeoDataFrame, to_crs=None) -> Network:
+def get_walk_graph(blocks: GeoDataFrame, to_crs) -> MultiDiGraph:
     graph = ox.graph_from_polygon(polygon=blocks.to_crs(crs=standard_crs).geometry.unary_union.convex_hull, network_type='walk', simplify=True)
-    nodes, edges = ox.graph_to_gdfs(G=ox.project_graph(graph, to_crs=to_crs), nodes=True, edges=True)
-    edges = edges.reset_index()
-    return Network(nodes['x'], nodes['y'], edges['u'], edges['v'], edges[['length']])
+    return ox.project_graph(G=graph, to_crs=to_crs)
 
 
 def get_utm_crs(geometry) -> str:
@@ -101,26 +98,25 @@ def polygon_to_x_y_coords(polygon: Polygon) -> [float, float]:
 
 def geodataframe_to_x_y_coords(objects: GeoDataFrame) -> [Series, Series]:
     x_coords, y_coords = zip(*objects.geometry.apply(func=lambda x: polygon_to_x_y_coords(x)))
-    return Series(x_coords), Series(y_coords)
+    return x_coords, y_coords
 
 
 def get_gravity_for_building_and_playground(area_playground: float, distance: float) -> float:
     return area_playground / (distance + 50.0) ** 2.0
 
 
-def set_nearest_nodes_to_objects(objects: GeoDataFrame, walk_graph: Network) -> None:
+def set_nearest_nodes_to_objects(objects: GeoDataFrame, walk_graph: MultiDiGraph) -> None:
     x_coords, y_coords = geodataframe_to_x_y_coords(objects=objects)
-    objects[node_id_label] = walk_graph.get_node_ids(x_col=x_coords, y_col=y_coords)
-    # objects[node_distance_label] =
+    objects[node_id_label] = ox.nearest_nodes(G=walk_graph, X=x_coords, Y=y_coords)
 
 
-def distribute_people_to_playgrounds(blocks: GeoDataFrame, living_buildings: GeoDataFrame, playgrounds: GeoDataFrame, walk_graph: Network) -> None:
+def distribute_people_to_playgrounds(blocks: GeoDataFrame, living_buildings: GeoDataFrame, playgrounds: GeoDataFrame, walk_graph: MultiDiGraph) -> None:
     set_nearest_nodes_to_objects(playgrounds, walk_graph)
     set_nearest_nodes_to_objects(living_buildings, walk_graph)
     max_meters_to_playground = 500
-
-    print(walk_graph.nodes_in_range([living_buildings.iloc[0][node_id_label]], radius=500))
-
+    result = nx.ego_graph(G=walk_graph, n=living_buildings.iloc[0][node_id_label], radius=max_meters_to_playground, distance='length')
+    print(result)
+    print()
     # for _, block in blocks.iterrows():
     #     block_living_buildings = living_buildings[living_buildings[block_id_label] == block['id']]
     #
@@ -134,6 +130,7 @@ def distribute_people_to_playgrounds(blocks: GeoDataFrame, living_buildings: Geo
     #
     #         # playgrounds_gravity = available_playgrounds.apply(func=lambda x: get_gravity_for_building_and_playground(x))
 
+
 def main():
     test_folder = Path() / 'data' / 'test'
 
@@ -146,7 +143,7 @@ def main():
     buildings = gpd.read_file(filename=test_folder / 'input_buildings.geojson').set_crs(crs=standard_crs).to_crs(crs=utm_crs)
     buildings = remove_objects_outside_blocks_and_set_block_id(blocks=blocks, objects=buildings)
 
-    living_buildings = buildings[buildings['population'] > 0]
+    living_buildings = buildings[buildings['population'] > 0].reset_index()
 
     playgrounds = gpd.read_file(filename=test_folder / 'input_playgrounds.geojson').set_crs(crs=standard_crs).to_crs(crs=utm_crs)
     playgrounds = playgrounds.explode(ignore_index=True)
@@ -156,13 +153,12 @@ def main():
     playgrounds['population'] = [0] * len(playgrounds)
     playgrounds = transform_point_objects_into_square_polygons_with_median_area(blocks=blocks, objects=playgrounds)
 
-    nodes_file_path, edges_file_path = test_folder / 'nodes.csv', test_folder / 'edges.csv'
-    if nodes_file_path.exists() and edges_file_path.exists():
-        nodes, edges = pd.read_csv(nodes_file_path, index_col=0), pd.read_csv(edges_file_path, index_col=0)
-        walk_graph = pandana.Network(nodes['x'], nodes['y'], edges['from'], edges['to'], GeoDataFrame({'distance': edges['length']}))
+    walk_graph_file = test_folder / 'walk_graph.graphml'
+    if walk_graph_file.exists():
+        walk_graph = ox.load_graphml(filepath=walk_graph_file)
     else:
         walk_graph = get_walk_graph(blocks=blocks, to_crs=utm_crs)
-        walk_graph.nodes_df.to_csv(nodes_file_path), walk_graph.edges_df.to_csv(edges_file_path)
+        ox.save_graphml(G=walk_graph, filepath=walk_graph_file)
 
     distribute_people_to_playgrounds(blocks, living_buildings, playgrounds, walk_graph)
 
@@ -179,6 +175,6 @@ def main():
     #
     #     distance = ox.shortest_path(G=walk_graph, orig=start_node, dest=end_node, weight='length')
     #     print(distance)
-    
+
 
 main()
