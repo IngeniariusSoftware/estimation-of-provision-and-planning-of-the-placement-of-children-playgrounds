@@ -26,7 +26,7 @@ def remove_objects_outside_blocks_and_set_block_id(blocks: GeoDataFrame, objects
         logging.warning(f' objects geoDataFrame already contains {block_id_label} column, renamed to {block_id_label}_(2)')
         inside_objects = inside_objects.rename(columns={block_id_label: f'{block_id_label}_(2)'})
     inside_objects = inside_objects.rename(columns={'id_right': block_id_label})
-    inside_objects = inside_objects[inside_objects[block_id_label].notna()].reset_index()
+    inside_objects = inside_objects[inside_objects[block_id_label].notna()].reset_index(drop=True)
     inside_objects = inside_objects.drop(columns=['index_right'])
     inside_objects = inside_objects.astype(dtype={block_id_label: int}, copy=False)
     logging.info(f' {len(objects) - len(inside_objects)} objects outside the blocks were deleted')
@@ -102,7 +102,7 @@ def geodataframe_to_x_y_coords(objects: GeoDataFrame) -> [Series, Series]:
 
 
 def get_gravity_for_building_and_playground(area_playground: float, distance: float) -> float:
-    return area_playground / (distance + 50.0) ** 2.0
+    return area_playground / ((distance + 50.0) ** 2.0)
 
 
 def set_nearest_nodes_to_objects(objects: GeoDataFrame, walk_graph: MultiDiGraph) -> None:
@@ -110,28 +110,30 @@ def set_nearest_nodes_to_objects(objects: GeoDataFrame, walk_graph: MultiDiGraph
     objects[node_id_label] = ox.nearest_nodes(G=walk_graph, X=x_coords, Y=y_coords)
 
 
-def distribute_people_to_playgrounds(blocks: GeoDataFrame, living_buildings: GeoDataFrame, playgrounds: GeoDataFrame, walk_graph: MultiDiGraph) -> None:
+def distribute_people_to_playgrounds(living_buildings: GeoDataFrame, playgrounds: GeoDataFrame, walk_graph: MultiDiGraph) -> None:
     set_nearest_nodes_to_objects(playgrounds, walk_graph)
     set_nearest_nodes_to_objects(living_buildings, walk_graph)
     max_meters_to_playground = 500
-    result = nx.ego_graph(G=walk_graph, n=living_buildings.iloc[0][node_id_label], radius=max_meters_to_playground, distance='length')
-    print(result)
-    print()
-    # for _, block in blocks.iterrows():
-    #     block_living_buildings = living_buildings[living_buildings[block_id_label] == block['id']]
-    #
-    #     walk_graph.nodes_in_range()
-    #     for _, living_building in block_living_buildings.iterrows():
-    #
-    #         graph = get_walk_isochrone_graph(start_point=living_building.geometry.centroid, meters=max_meters_to_playground, walk_graph=walk_graph)
-    #         isochrone = graph_to_polygon(graph)
-    #         available_playgrounds = playgrounds[playgrounds.intersects(other=isochrone)]
-    #         for _, playground in available_playgrounds.iterrows():
-    #
-    #         # playgrounds_gravity = available_playgrounds.apply(func=lambda x: get_gravity_for_building_and_playground(x))
+    for i, living_building in living_buildings.iterrows():
+        subgraph = nx.ego_graph(G=walk_graph, n=living_building[node_id_label], radius=max_meters_to_playground, distance='length')
+        available_playgrounds = playgrounds[playgrounds[node_id_label].isin(subgraph.nodes)].reset_index(drop=True)
+        if available_playgrounds.empty:
+            living_building['undistributed'] = 1.0
+            continue
+
+        gravity = []
+        for _, playground in available_playgrounds.iterrows():
+            distance = nx.shortest_path_length(G=subgraph, source=living_building[node_id_label], target=playground[node_id_label], weight='length')
+            gravity.append(get_gravity_for_building_and_playground(area_playground=playground['area'], distance=distance))
+
+        whole_gravity = sum(gravity)
+        distribution = list([living_building['population'] * g / whole_gravity for g in gravity])
+        for j, playground in available_playgrounds.iterrows():
+            playground['living_buildings_neighbours'].append((i, distribution[j]))
 
 
 def main():
+    playground_area_per_people = 0.5
     test_folder = Path() / 'data' / 'test'
 
     blocks = gpd.read_file(filename=test_folder / 'blocks.geojson').set_crs(crs=standard_crs)
@@ -143,15 +145,18 @@ def main():
     buildings = gpd.read_file(filename=test_folder / 'input_buildings.geojson').set_crs(crs=standard_crs).to_crs(crs=utm_crs)
     buildings = remove_objects_outside_blocks_and_set_block_id(blocks=blocks, objects=buildings)
 
-    living_buildings = buildings[buildings['population'] > 0].reset_index()
+    living_buildings = buildings[buildings['population'] > 0].reset_index(drop=True)
+    living_buildings['undistributed'] = [0.0] * len(living_buildings)
 
     playgrounds = gpd.read_file(filename=test_folder / 'input_playgrounds.geojson').set_crs(crs=standard_crs).to_crs(crs=utm_crs)
     playgrounds = playgrounds.explode(ignore_index=True)
     playgrounds = remove_objects_outside_blocks_and_set_block_id(blocks=blocks, objects=playgrounds)
     playgrounds = remove_contained_points_in_objects_from_geodataframe(data=playgrounds, blocks=blocks, objects=buildings)
+    playgrounds = transform_point_objects_into_square_polygons_with_median_area(blocks=blocks, objects=playgrounds)
     playgrounds['area'] = round(playgrounds.geometry.area, 2)
     playgrounds['population'] = [0] * len(playgrounds)
-    playgrounds = transform_point_objects_into_square_polygons_with_median_area(blocks=blocks, objects=playgrounds)
+    playgrounds['living_buildings_neighbours'] = [[] for _ in range(len(playgrounds))]
+    playgrounds['capacity'] = playgrounds['area'] / playground_area_per_people
 
     walk_graph_file = test_folder / 'walk_graph.graphml'
     if walk_graph_file.exists():
@@ -160,21 +165,6 @@ def main():
         walk_graph = get_walk_graph(blocks=blocks, to_crs=utm_crs)
         ox.save_graphml(G=walk_graph, filepath=walk_graph_file)
 
-    distribute_people_to_playgrounds(blocks, living_buildings, playgrounds, walk_graph)
-
-    # walk_graph.get_node_ids(x_col=playgrounds, y_col=)
-    # graph = get_isochrone_walk_graph(start_point=living_buildings.iloc[0].geometry.centroid, meters=500, walk_graph=walk_graph)
-    # polygon = graph_to_polygon(graph=graph)
-    # available_playgrounds = playgrounds[playgrounds.intersects(other=polygon)]
-    # for _, playground in available_playgrounds.iterrows():
-    #     start_point = living_buildings.iloc[0].geometry.centroid
-    #     start_node = ox.nearest_nodes(G=walk_graph, X=start_point.x, Y=start_point.y)
-    #
-    #     end_point = playground.geometry.centroid
-    #     end_node = ox.nearest_nodes(G=walk_graph, X=end_point.x, Y=end_point.y)
-    #
-    #     distance = ox.shortest_path(G=walk_graph, orig=start_node, dest=end_node, weight='length')
-    #     print(distance)
-
+    distribute_people_to_playgrounds(living_buildings, playgrounds, walk_graph)
 
 main()
