@@ -82,10 +82,6 @@ def get_utm_crs(geometry) -> str:
     return f'+proj=utm +zone={utm_zone} +ellps=WGS84 +datum=WGS84 +units=m +no_defs'
 
 
-def get_isochrone_walk_graph(start_point: Point, meters: int, walk_graph: MultiDiGraph) -> MultiDiGraph:
-    return nx.ego_graph(G=walk_graph, n=ox.nearest_nodes(G=walk_graph, X=start_point.x, Y=start_point.y), radius=meters, distance='length')
-
-
 def graph_to_polygon(graph: MultiDiGraph) -> Polygon:
     node_points = [Point((data['x'], data['y'])) for node, data in graph.nodes(data=True)]
     return GeoSeries(node_points).unary_union.convex_hull
@@ -110,15 +106,14 @@ def set_nearest_nodes_to_objects(objects: GeoDataFrame, walk_graph: MultiDiGraph
     objects[node_id_label] = ox.nearest_nodes(G=walk_graph, X=x_coords, Y=y_coords)
 
 
-def distribute_people_to_playgrounds(living_buildings: GeoDataFrame, playgrounds: GeoDataFrame, walk_graph: MultiDiGraph) -> None:
+def distribute_people_to_playgrounds(living_buildings: GeoDataFrame, playgrounds: GeoDataFrame, walk_graph: MultiDiGraph, max_meters_to_playground: int) -> None:
     set_nearest_nodes_to_objects(playgrounds, walk_graph)
     set_nearest_nodes_to_objects(living_buildings, walk_graph)
-    max_meters_to_playground = 500
     for i, living_building in living_buildings.iterrows():
         subgraph = nx.ego_graph(G=walk_graph, n=living_building[node_id_label], radius=max_meters_to_playground, distance='length')
         available_playgrounds = playgrounds[playgrounds[node_id_label].isin(subgraph.nodes)].reset_index(drop=True)
         if available_playgrounds.empty:
-            living_building['undistributed'] = 1.0
+            living_building['undistributed'] = living_building['population']
             continue
 
         gravity = []
@@ -130,6 +125,24 @@ def distribute_people_to_playgrounds(living_buildings: GeoDataFrame, playgrounds
         distribution = list([living_building['population'] * g / whole_gravity for g in gravity])
         for j, playground in available_playgrounds.iterrows():
             playground['living_buildings_neighbours'].append((i, distribution[j]))
+
+
+def calculate_playgrounds_over_capacity(playgrounds: GeoDataFrame, living_buildings: GeoDataFrame) -> None:
+    undistributed = list(living_buildings['undistributed'])
+    fullness = []
+    for _, playground in playgrounds.iterrows():
+        real_capacity = sum(population for _, population in playground['living_buildings_neighbours'])
+        fullness.append(real_capacity / playground['capacity'])
+        over_capacity = real_capacity - playground['capacity']
+        if over_capacity <= 0:
+            continue
+
+        for i, population in playground['living_buildings_neighbours']:
+            undistributed[i] += population / real_capacity * over_capacity
+
+    playgrounds['fullness'] = fullness
+    living_buildings['undistributed'] = undistributed
+    living_buildings['undistributed'] /= living_buildings['population']
 
 
 def main():
@@ -165,6 +178,11 @@ def main():
         walk_graph = get_walk_graph(blocks=blocks, to_crs=utm_crs)
         ox.save_graphml(G=walk_graph, filepath=walk_graph_file)
 
-    distribute_people_to_playgrounds(living_buildings, playgrounds, walk_graph)
+    distribute_people_to_playgrounds(living_buildings=living_buildings, playgrounds=playgrounds, walk_graph=walk_graph, max_meters_to_playground=500)
+    calculate_playgrounds_over_capacity(playgrounds=playgrounds, living_buildings=living_buildings)
+
+    playgrounds.drop(columns=['living_buildings_neighbours']).to_crs(standard_crs).to_file(filename='playgrounds.geojson', driver='GeoJSON')
+    living_buildings.to_crs(standard_crs).to_file(filename='living_buildings.geojson', driver='GeoJSON')
+
 
 main()
