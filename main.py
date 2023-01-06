@@ -1,7 +1,9 @@
 import math
+import numpy
 import scipy
+import folium
 import logging
-import numpy as np
+import webbrowser
 import osmnx as ox
 import pandas as pd
 import networkx as nx
@@ -10,6 +12,7 @@ import geopandas as gpd
 from pathlib import Path
 from pandas import Series
 from shapely import affinity
+from folium import Map, GeoJson, GeoJsonPopup, Choropleth
 from networkx import MultiDiGraph
 from geopandas import GeoDataFrame, GeoSeries
 from shapely.geometry import Point, Polygon, LineString
@@ -42,10 +45,13 @@ def get_geometry_angle(geometry: Polygon):
 
 
 def transform_point_objects_into_square_polygons_with_median_area(blocks: GeoDataFrame, objects: GeoDataFrame) -> GeoDataFrame:
+    points = objects[objects.geometry.geom_type == 'Point'].copy()
+    if points.empty:
+        return objects
+
     polygons = objects[objects.geometry.geom_type == 'Polygon']
     median_area = polygons.geometry.area.median()
     square_length = math.sqrt(median_area)
-    points = objects[objects.geometry.geom_type == 'Point'].copy()
     angles = list(blocks.geometry.apply(func=lambda x: get_geometry_angle(x)))
     points.geometry = points.apply(
         func=lambda x: generate_rotated_square_from_point(point=x.geometry, length=square_length, angle=angles[x[block_id_label]]), axis=1)
@@ -71,7 +77,7 @@ def remove_contained_points_in_objects_from_geodataframe(data: GeoDataFrame, blo
     return data.drop(indexes, axis=0)
 
 
-def get_walk_graph(blocks: GeoDataFrame, to_crs) -> MultiDiGraph:
+def load_walk_graph(blocks: GeoDataFrame, to_crs) -> MultiDiGraph:
     graph = ox.graph_from_polygon(polygon=blocks.to_crs(crs=standard_crs).geometry.unary_union.convex_hull, network_type='walk', simplify=True)
     return ox.project_graph(G=graph, to_crs=to_crs)
 
@@ -103,10 +109,11 @@ def get_gravity_for_building_and_playground(area_playground: float, distance: fl
 
 def set_nearest_nodes_to_objects(objects: GeoDataFrame, walk_graph: MultiDiGraph) -> None:
     x_coords, y_coords = geodataframe_to_x_y_coords(objects=objects)
-    objects[node_id_label] = ox.nearest_nodes(G=walk_graph, X=x_coords, Y=y_coords)
+    objects[node_id_label], objects[node_distance_label] = ox.nearest_nodes(G=walk_graph, X=x_coords, Y=y_coords, return_dist=True)
 
 
-def distribute_people_to_playgrounds(living_buildings: GeoDataFrame, playgrounds: GeoDataFrame, walk_graph: MultiDiGraph, max_meters_to_playground: int) -> None:
+def distribute_people_to_playgrounds(living_buildings: GeoDataFrame, playgrounds: GeoDataFrame, walk_graph: MultiDiGraph,
+                                     max_meters_to_playground: int) -> None:
     set_nearest_nodes_to_objects(playgrounds, walk_graph)
     set_nearest_nodes_to_objects(living_buildings, walk_graph)
     for i, living_building in living_buildings.iterrows():
@@ -119,6 +126,7 @@ def distribute_people_to_playgrounds(living_buildings: GeoDataFrame, playgrounds
         gravity = []
         for _, playground in available_playgrounds.iterrows():
             distance = nx.shortest_path_length(G=subgraph, source=living_building[node_id_label], target=playground[node_id_label], weight='length')
+            distance += living_building[node_distance_label] + playground[node_distance_label]
             gravity.append(get_gravity_for_building_and_playground(area_playground=playground['area'], distance=distance))
 
         whole_gravity = sum(gravity)
@@ -145,23 +153,29 @@ def calculate_playgrounds_over_capacity(playgrounds: GeoDataFrame, living_buildi
     living_buildings['undistributed'] /= living_buildings['population']
 
 
-def main():
-    playground_area_per_people = 0.5
-    test_folder = Path() / 'data' / 'test'
-
-    blocks = gpd.read_file(filename=test_folder / 'blocks.geojson').set_crs(crs=standard_crs)
+def get_blocks(filename: Path) -> GeoDataFrame:
+    blocks = gpd.read_file(filename=filename).set_crs(crs=standard_crs)
     utm_crs = get_utm_crs(blocks.geometry)
-
     blocks = blocks.explode(ignore_index=True).to_crs(crs=utm_crs)
     blocks['id'] = blocks.index
+    return blocks
 
-    buildings = gpd.read_file(filename=test_folder / 'input_buildings.geojson').set_crs(crs=standard_crs).to_crs(crs=utm_crs)
+
+def get_buildings(filename: Path, blocks: GeoDataFrame, to_crs) -> GeoDataFrame:
+    buildings = gpd.read_file(filename=filename).set_crs(crs=standard_crs).to_crs(crs=to_crs)
     buildings = remove_objects_outside_blocks_and_set_block_id(blocks=blocks, objects=buildings)
+    return buildings
 
+
+def get_living_buildings(buildings: GeoDataFrame) -> GeoDataFrame:
     living_buildings = buildings[buildings['population'] > 0].reset_index(drop=True)
     living_buildings['undistributed'] = [0.0] * len(living_buildings)
+    return living_buildings
 
-    playgrounds = gpd.read_file(filename=test_folder / 'input_playgrounds.geojson').set_crs(crs=standard_crs).to_crs(crs=utm_crs)
+
+def get_playgrounds(filename: Path, blocks: GeoDataFrame, buildings: GeoDataFrame, to_crs) -> GeoDataFrame:
+    playground_area_per_people = 0.5
+    playgrounds = gpd.read_file(filename=filename).set_crs(crs=standard_crs).to_crs(crs=to_crs)
     playgrounds = playgrounds.explode(ignore_index=True)
     playgrounds = remove_objects_outside_blocks_and_set_block_id(blocks=blocks, objects=playgrounds)
     playgrounds = remove_contained_points_in_objects_from_geodataframe(data=playgrounds, blocks=blocks, objects=buildings)
@@ -170,19 +184,78 @@ def main():
     playgrounds['population'] = [0] * len(playgrounds)
     playgrounds['living_buildings_neighbours'] = [[] for _ in range(len(playgrounds))]
     playgrounds['capacity'] = playgrounds['area'] / playground_area_per_people
+    return playgrounds
 
-    walk_graph_file = test_folder / 'walk_graph.graphml'
-    if walk_graph_file.exists():
-        walk_graph = ox.load_graphml(filepath=walk_graph_file)
+
+def get_walk_graph(filename: Path, blocks: GeoDataFrame, to_crs) -> MultiDiGraph:
+    if filename.exists():
+        walk_graph = ox.load_graphml(filepath=filename)
     else:
-        walk_graph = get_walk_graph(blocks=blocks, to_crs=utm_crs)
-        ox.save_graphml(G=walk_graph, filepath=walk_graph_file)
+        walk_graph = load_walk_graph(blocks=blocks, to_crs=to_crs)
+        ox.save_graphml(G=walk_graph, filepath=filename)
+    return walk_graph
 
-    distribute_people_to_playgrounds(living_buildings=living_buildings, playgrounds=playgrounds, walk_graph=walk_graph, max_meters_to_playground=500)
-    calculate_playgrounds_over_capacity(playgrounds=playgrounds, living_buildings=living_buildings)
 
-    playgrounds.drop(columns=['living_buildings_neighbours']).to_crs(standard_crs).to_file(filename='playgrounds.geojson', driver='GeoJSON')
-    living_buildings.to_crs(standard_crs).to_file(filename='living_buildings.geojson', driver='GeoJSON')
+def save_map_and_open_in_browser(filename: Path, folium_map) -> None:
+    open_in_new_tab = 2
+    folium_map.save(filename)
+    webbrowser.open(url=str(filename), new=open_in_new_tab)
+
+
+def draw_result_map(filename: Path, blocks: GeoDataFrame, playgrounds: GeoDataFrame) -> None:
+    location = blocks.to_crs(standard_crs).geometry.unary_union.convex_hull.centroid
+    folium_map = Map(location=(location.y, location.x), zoom_start=13, tiles=None)
+
+    GeoJson(data=blocks[['geometry', 'id']],
+            name='Кварталы',
+            popup=GeoJsonPopup(fields=['id'], aliases=['Номер квартала']),
+            style_function=lambda x: {'fillColor': '#f5f5f5', 'lineColor': '#ffffbf', 'weight': '2'},
+            highlight_function=lambda x: {'weight': '4'},
+            smooth_factor=0.1
+            ).add_to(parent=folium_map)
+
+    Choropleth(geo_data=playgrounds[['geometry', 'fullness']],
+               name='Детские площадки (хороплет)',
+               data=playgrounds['fullness'],
+               key_on='feature.id',
+               fill_color='PuRd',
+               line_opacity=0.5,
+               legend_name="Загруженность площадок",
+               bins=[0.0, 0.25, 0.5, 0.75, 1.0, 1.5, max(playgrounds['fullness'])]
+               ).add_to(folium_map)
+
+    GeoJson(data=playgrounds[['geometry', 'area', 'capacity', 'fullness']],
+            name='Детские площадки (подсказки)',
+            style_function=lambda x: {'color': 'black', 'fillColor': 'transparent', 'weight': 0.5},
+            popup=GeoJsonPopup(
+                fields=['area', 'capacity', 'fullness'],
+                aliases=['Площадь м²', 'Вместимость', 'Загруженность']
+            ),
+            highlight_function=lambda x: {'weight': 2},
+            ).add_to(folium_map)
+
+    folium.TileLayer('cartodbpositron', overlay=False, name='Светлая тема').add_to(folium_map)
+    folium.TileLayer('cartodbdark_matter', overlay=False, name='Темная тема').add_to(folium_map)
+    folium.LayerControl(collapsed=False).add_to(folium_map)
+
+    save_map_and_open_in_browser(filename=filename, folium_map=folium_map)
+
+
+def main():
+    test_folder = Path() / 'data' / 'test'
+    blocks = get_blocks(filename=test_folder / 'blocks.geojson')
+    utm_crs = blocks.crs
+    buildings = get_buildings(filename=test_folder / 'input_buildings.geojson', blocks=blocks, to_crs=utm_crs)
+    living_buildings = get_living_buildings(buildings=buildings)
+    playgrounds = get_playgrounds(filename=Path('playgrounds.geojson'), blocks=blocks, buildings=buildings, to_crs=utm_crs)
+    # walk_graph = get_walk_graph(filename=test_folder / 'walk_graph.graphml', blocks=blocks, to_crs=utm_crs)
+    # distribute_people_to_playgrounds(living_buildings=living_buildings, playgrounds=playgrounds, walk_graph=walk_graph, max_meters_to_playground=500)
+    # calculate_playgrounds_over_capacity(playgrounds=playgrounds, living_buildings=living_buildings)
+
+    draw_result_map(filename=Path('map.html'), blocks=blocks, playgrounds=playgrounds)
+
+    # playgrounds.drop(columns=['living_buildings_neighbours']).to_crs(standard_crs).to_file(filename='playgrounds.geojson', driver='GeoJSON')
+    # living_buildings.to_crs(standard_crs).to_file(filename='living_buildings.geojson', driver='GeoJSON')
 
 
 main()
