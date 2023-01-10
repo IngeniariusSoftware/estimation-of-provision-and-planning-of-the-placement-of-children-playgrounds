@@ -90,4 +90,4 @@
 
 1. [First step map](https://github.com/IngeniariusSoftware/estimation-of-provision-and-planning-of-the-placement-of-children-playgrounds/releases/download/1.0.0/map_before.html)
 
-2. [Map after generating new playgorouns](data/demonstration.map_after.html](https://github.com/IngeniariusSoftware/estimation-of-provision-and-planning-of-the-placement-of-children-playgrounds/releases/download/1.0.0/map_after.html))
+2. [Map after generating new playgorouns](https://github.com/IngeniariusSoftware/estimation-of-provision-and-planning-of-the-placement-of-children-playgrounds/releases/download/1.0.0/map_after.html)
